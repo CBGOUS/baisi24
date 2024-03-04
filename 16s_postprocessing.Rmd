@@ -1,0 +1,646 @@
+---
+title: "For the article"
+author: "Kine Kragl Engseth"
+output: 
+  html_document:
+    toc: true # setting a table of content     
+    toc_float: true # making the table of content floating     
+    theme: flatly # setting theme     
+    code_folding: show # hiding code with codefolding
+editor_options: 
+  chunk_output_type: console
+---
+
+
+
+# Data Wrangling
+
+## Load the data
+
+```{r global chunk options, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE)
+```
+
+Loading the libraries
+
+```{r load libraries}
+
+library(tidyverse)
+library(phyloseq)
+library(qiime2R) # for converting .qza from QIIME2 into phyloseq objects
+library(pals) # for the color palette alphabet, used in the relative abundance plots
+library(vegan) # for adonis2, used to create the PERMANOVA
+library(ggvenn) # used to create venn diagram
+library(gplots) # for venn() used to create venn diagram
+library(ranacapa) # for ggrare() used in the rarefaction curves
+```
+
+
+
+
+Loading phyloseq object with the output from QIIME2
+
+```{r import with qiime2R}
+
+# Creating variable for datapath for easier access using file.path() later
+dataPath <- "./data/run1_24_saliva_nasal_samples"
+
+
+# Creating a phyloseq object from the qiime2 artifacts
+physeq.obj <- qza_to_phyloseq(
+  features = file.path(dataPath, "3-table.qza"), 
+  tree = file.path(dataPath, "6-rooted-tree.qza"), 
+  taxonomy = file.path(dataPath, "4-taxonomy.qza"),
+  metadata = file.path(dataPath, "16s_paper_analysis__sample-metadata.tsv"))
+
+```
+
+
+Adding a "type" column to the metadata, to distinguish between "samples" and "control"
+
+```{r adding new column to metadata}
+
+# Extracting metadata from the phyloseq object
+raw_metadata <- sample_data(physeq.obj)
+
+# Making sure all sample names match with the extracted metadata
+if(!all(rownames(raw_metadata) == sample_names(physeq.obj))) {
+  stop("Sample names in metadata do not match sample names in phyloseq object")
+}
+
+# Adding new column, will be "control" if the source column is "pos" or "neg"
+raw_metadata$type <- if_else(raw_metadata$source %in% c("pos", "neg"), "control", "sample")
+
+# Check if the sample names are still aligned after modification
+if(!all(rownames(raw_metadata) == sample_names(physeq.obj))) {
+  stop("Sample names mismatch after modification")
+}
+
+# Adding the altered metadata back 
+sample_data(physeq.obj) <- raw_metadata
+```
+
+
+
+## Remove possible contaminations
+
+*Remove possible contamination ASV in negative control (water sample)*
+
+
+Printing dimensions before filtering the data:
+
+```{r}
+cat("Before filtering, there are", nsamples(physeq.obj), "samples and", ntaxa(physeq.obj), "ASVs.\n")
+```
+
+ASVs with non-zero counts in the negative control, are being removed from the taxonomy table
+
+```{r}
+
+# Subset the phyloseq object to keep only negative control samples
+neg_ctrls.obj <- subset_samples(physeq.obj, source == "neg")
+
+# Access the OTU (or ASV) table
+otu_tbl_neg_ctrls <- otu_table(neg_ctrls.obj)
+
+# Find ASVs with non-zero values in negative controls
+non_zero_neg_asvs <- apply(otu_tbl_neg_ctrls, 1, function(x) any(x > 0))
+
+# Extract the names of these ASVs
+non_zero_neg_asv_names <- names(non_zero_neg_asvs[non_zero_neg_asvs])
+
+# Full list of taxa names
+allTaxa <- taxa_names(physeq.obj)
+
+# Removing the ASVs with counts in neg control
+no_neg_Taxa <- allTaxa[!(allTaxa %in% non_zero_neg_asv_names)]
+
+# Attaching this new taxonomy to the physeq object
+pruned_physeq.obj <- prune_taxa(no_neg_Taxa, physeq.obj)
+```
+
+
+
+## Remove positive and negative controls
+
+
+```{r}
+# Extract sample names from the filtered phyloseq object
+sample_names_no_ctrl <- subset_samples(pruned_physeq.obj, type != "control") %>% 
+  sample_names()
+
+# Pruning the sample names to only keep the samples, not the controls
+pruned_physeq.obj <- prune_samples(sample_names_no_ctrl, pruned_physeq.obj)
+
+```
+
+
+## Finish cleaning up non-relevant information
+
+Selecting only the kingdom "Bacteria" in order to remove all unassigned samples, 
+as well as samples that are not bacterial (such as Archaea)
+
+```{r}
+bact_physeq.obj <- subset_taxa(pruned_physeq.obj, Kingdom == "d__Bacteria")
+```
+
+Turning the `phyloseq`-object into one into a big, big dataframe, for easier plotting
+
+```{r}
+bact_melt <- psmelt(bact_physeq.obj)
+```
+
+
+Printing dimensions after filtering the data:
+
+```{r}
+cat("After filtering, there are", nsamples(bact_physeq.obj), "samples and", ntaxa(bact_physeq.obj), "ASVs.\n")
+```
+
+
+# Methods for plots
+
+## Observed ASV boxplot
+
+When calculating richness, it is easy to use `estimate_richness()`. For certain richness metrics, however, the rownames will be slightly changed. Creating a function to clean up the data easily, in case this happens again.
+
+
+```{r}
+clean_rownames <- function(df) {
+    # Check if df is a data frame
+    if (!is.data.frame(df)) {
+        stop("Input must be a data frame")
+    }
+
+    # Remove the leading 'X' and replace '.' with '-'
+    formatted_row_names <- gsub("^X", "", rownames(df))  # Remove the 'X' at the beginning
+    formatted_row_names <- gsub("\\.", "-", formatted_row_names)  # Replace '.' with '-'
+
+    # Update the row names in the data frame
+    rownames(df) <- formatted_row_names
+    
+    # Return the modified data frame
+    return(df)
+}
+```
+
+Calculating richness, and cleaning up rownames
+
+```{r}
+richness.tbl <- estimate_richness(bact_physeq.obj) %>% 
+  clean_rownames()
+```
+
+ 
+Getting the observed ASVs
+
+```{r}
+# Extracting the column for observed
+obs_richness <- richness.tbl[1] %>% 
+  rownames_to_column(var = "sampleID")
+
+# Extracting metadata from the phyloseq object to add "source"
+metadata_temp <- sample_data(bact_physeq.obj)
+metadata_temp$sampleID <- rownames(metadata_temp)
+
+# Adding the metadata to this table
+obs_richness.tbl <- obs_richness %>% right_join(metadata_temp)
+
+# dropping the "type" column, as it is no longer needed
+obs_richness.tbl <- obs_richness.tbl[, 1:3] 
+```
+
+Plotting observed taxa in a scatter plot
+
+```{r}
+obsASV_boxplot <- ggplot(obs_richness.tbl, aes(source, Observed, fill=source)) +
+  geom_boxplot() + 
+  scale_fill_manual(values=c("cornflowerblue","indianred", "turquoise")) +
+  stat_summary(fun=mean, geom="point", shape=23, size=4) + # adds a diamond for the mean
+  geom_jitter(shape=21, width=0.2, height=0) +
+  theme_bw() + 
+  ggtitle("Distribution of Observed ASVs Across Sample Locations") + 
+  ylab("Observed ASVs") +
+  xlab("Sample location") +
+  scale_x_discrete(labels=c("Nasal aspirate", "Nasal Swab", "Saliva")) + # Renaming x-axis categories
+  theme(legend.position="none") + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+## Shannon diversity boxplot
+
+
+
+Calculating Shannon diversity 
+
+```{r}
+# Calculating shannon values for the pruned data
+shannon_values <-  estimate_richness(bact_physeq.obj, measures = "Shannon") %>% 
+  rownames_to_column(var = "sampleID")
+
+shannon_values.tbl <- shannon_values %>% right_join(metadata_temp)
+shannon_values.tbl <- shannon_values.tbl[, 1:3] # dropping the "type" column, as it is no longer needed
+```
+
+
+Plotting Shannon diversity
+
+```{r}
+shannon_values_boxplot <- ggplot(shannon_values.tbl, aes(source, Shannon, fill=source)) +
+  geom_boxplot() + 
+  stat_summary(fun=mean, geom="point", shape=23, size=4) + # adds a diamond for the avg mean
+  scale_fill_manual(values=c("cornflowerblue","indianred", "turquoise")) + 
+  geom_jitter(shape=21, width=0.2, height=0) +
+  theme_bw() + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(legend.position="none") + #remove the legend as it isn't needed
+  scale_x_discrete(labels=c("Nasal aspirate", "Nasal Swab", "Saliva")) + # Renaming x-axis categories
+  ggtitle("Shannon diversity of samples") + 
+  xlab("Sample location") +
+  ylab("Shannon Diversity")
+```
+
+
+
+
+## Relative abundance stacked barplots
+
+
+### Genus
+
+
+Calculating the top 20 genera, based on relative abundance of the entire dataset
+
+```{r}
+# Agglomerating the dataset on "Genus"
+bact_genus <- tax_glom(bact_physeq.obj, "Genus")
+bact_genus_plot <- psmelt(bact_genus)
+
+# Converting the values to relative abundance
+physeq_genus_rel_abundance <- transform_sample_counts(bact_genus, function(x) x / sum(x))
+
+# Creating a dataframe out of the phyloseq object, in order to plot
+df_genus <- psmelt(physeq_genus_rel_abundance)
+
+# Removing everything but the abundance and Genus
+df_genus <- df_genus[, c(3, 11)]
+
+# Finding the top 20 
+top_20_genus <- df_genus %>%
+  group_by(Genus) %>%
+  summarise(Total_Abundance = sum(Abundance)) %>% 
+  arrange(desc(Total_Abundance)) %>% 
+  top_n(20)
+
+# Finding the names of the top 20
+top_20_whole_genus_names <- pull(top_20_genus, "Genus")
+```
+
+Replacing every other Genus (that is not in the top 20) with "Other".
+
+```{r}
+# Adding new column, will be "control" if the source column is "pos" or "neg"
+bact_genus_plot$Genus <- if_else(bact_genus_plot$Genus %in% top_20_whole_genus_names, as.character(bact_genus_plot$Genus), "Other")
+
+# Factorizing Genus in order to decide the order in the legend (descending abundance)
+bact_genus_plot <- bact_genus_plot %>%
+  mutate(Genus = factor(Genus, levels = c(top_20_whole_genus_names, "Other")))
+```
+
+Plotting the relative abundance for Genus
+
+```{r}
+# Custom labelling function for facet labels
+custom_labeller <- function(variable,value){
+  source.labs <- c("nasal_aspirate" = "Nasal aspirate", "nasal_swab" = "Nasal swab", "saliva" = "Saliva")
+  return(source.labs[value])
+}
+
+
+figure_top20_genus <- ggplot(bact_genus_plot, aes(x = Sample, y = Abundance, fill = Genus)) +
+  geom_col(position = "fill") +
+  theme_bw() +
+  facet_grid(~ bact_genus_plot$source, scales = "free", space = "free",  labeller = labeller(source = custom_labeller)) +
+  #scale_fill_viridis(discrete = T) +
+  #scale_fill_brewer(palette = col_vector) +
+  scale_fill_manual(values=unname(alphabet())) +
+  guides(fill = guide_legend(keyheight = 0.2, 
+                             keywidth = 0.9,
+                             ncol = 1)) +
+  theme(axis.text.x = element_text(angle = 90), 
+        legend.position = "right",
+        legend.box = "vertical", 
+        legend.margin = margin(-10, 0, 0, 0),
+        plot.title = element_text(hjust = 0.5),
+        axis.title.x = element_text(margin = margin(t = 5, unit = "mm"))) +
+  ggtitle("Comparative Overview of Top 20 Genera by Relative Abundance") + 
+  ylab("Relative abundance") + 
+  xlab("Sample")
+
+figure_top20_genus
+```
+
+
+
+### Family
+
+Calculating top 20 families:
+
+```{r}
+bact_family <- tax_glom(bact_physeq.obj, "Family")
+bact_family_plot <- psmelt(bact_family)
+
+physeq_family_rel_abundance <- transform_sample_counts(bact_family, function(x) x / sum(x))
+
+df_family <- psmelt(physeq_family_rel_abundance)
+
+df_family <- df_family[, c(3, 10)]
+
+top_20_family <- df_family %>%
+  drop_na() %>% 
+  group_by(Family) %>%
+  summarise(Total_Abundance = sum(Abundance)) %>% 
+  arrange(desc(Total_Abundance)) %>% 
+  top_n(20)
+
+
+top_20_whole_family_names <- pull(top_20_family, "Family")
+```
+
+
+
+```{r}
+
+# Adding new column, will be "control" if the source column is "pos" or "neg"
+bact_family_plot$Family <- if_else(bact_family_plot$Family %in% top_20_whole_family_names, as.character(bact_family_plot$Family), "Other")
+
+# Factorizing Genus in order to decide the order in the legend
+bact_family_plot <- bact_family_plot %>%
+  mutate(Family = factor(Family, levels = c(top_20_whole_family_names, "Other")))
+
+
+# Custom labelling function for facet labels
+custom_labeller <- function(variable,value){
+  source.labs <- c("nasal_aspirate" = "Nasal aspirate", "nasal_swab" = "Nasal swab", "saliva" = "Saliva")
+  return(source.labs[value])
+}
+
+
+figure_whole20_family <- ggplot(bact_family_plot, aes(x = Sample, y = Abundance, fill = Family)) +
+  geom_col(position = "fill") +
+  theme_bw() +
+  facet_grid(~source, scales = "free", space = "free",  labeller = labeller(source = custom_labeller)) +
+  #scale_fill_viridis(discrete = T) +
+  #scale_fill_brewer(palette = col_vector) +
+  scale_fill_manual(values=unname(alphabet())) +
+  guides(fill = guide_legend(keyheight = 0.2, 
+                             keywidth = 0.9,
+                             ncol = 1)) +
+  theme(axis.text.x = element_text(angle = 90), 
+        legend.position = "right",
+        legend.box = "vertical", 
+        legend.margin = margin(-10, 0, 0, 0),
+        plot.title = element_text(hjust = 0.5),
+        axis.title.x = element_text(margin = margin(t = 5, unit = "mm"))) +
+  ggtitle("Comparative Overview of Top 20 Family by Relative Abundance") + 
+  ylab("Relative abundance") + 
+  xlab("Sample")
+
+figure_whole20_family
+```
+
+
+## Principal Coordinates Analysis
+
+Calculating Bray-Curtis dissimilarity and making a PCoA of our raw data, using Bray-Curtis dissimilarity.
+
+```{r}
+distance.bc <- phyloseq::distance(bact_physeq.obj, method = "bray")
+
+ord.obj <- ordinate(bact_physeq.obj, method = "PCoA", distance = distance.bc)
+```
+
+Plotting the PCoA
+
+```{r}
+PCoA_plot <- plot_ordination(bact_physeq.obj, ord.obj, color = "source") +
+  theme_bw() +
+  ggtitle("PCoA of Microbial Communities by Sample Site") +
+  scale_color_manual(
+    name = "Sample source",
+    values = c("#4daf4a", "#ff7f00", "#377eb8"),
+    labels = c("Nasal Aspirate", "Nasal Swab", "Saliva"))
+```
+
+## NMDS
+
+Not sure if we are going to include it in the paper, but I am attaching my code for the NMDS that I did, for transparency.
+
+
+
+```{r}
+set.seed(3)  # set seed for random generator
+nmds.obj <- ordinate(bact_physeq.obj, method = "NMDS", distance = distance.bc)
+```
+
+```{r}
+nmds_plot <- plot_ordination(bact_physeq.obj, nmds.obj, color = "source",
+                      title = str_c("NMDS, stress=", format(nmds.obj$stress, digits = 3)))
+nmds_plot <- nmds_plot + 
+  geom_point(alpha = 0.2, size = 10) +
+  scale_color_manual(
+    name = "Sample source",
+    values = c("#3baea0", "#f67280", "#00bbf0"),
+    labels = c("Nasal Aspirate", "Nasal Swab", "Saliva")) +
+  ggtitle("NMDS Visualization of Microbial Sample Sites")
+```
+
+
+
+
+## Venn diagram
+
+
+Create a list of ASVs that occur (count > 0) in each sample
+
+```{r}
+# Subset data for each site
+saliva_samples <- subset_samples(bact_physeq.obj, source == "saliva")
+nasal_swab_samples <- subset_samples(bact_physeq.obj, source == "nasal_swab")
+nasal_aspirate_samples <- subset_samples(bact_physeq.obj, source == "nasal_aspirate")
+
+
+# SALIVA
+
+OTU_table_saliva <- otu_table(saliva_samples)
+non_zero_asvs_saliva_idx <- apply(OTU_table_saliva, 1, function(x) any(x > 0))
+non_zero_asv_names_saliva <- names(non_zero_asvs_saliva_idx[non_zero_asvs_saliva_idx])
+
+# NASAL SWAB
+
+OTU_table_nasal_swab <- otu_table(nasal_swab_samples)
+non_zero_asvs_nasal_swab_idx <- apply(OTU_table_nasal_swab, 1, function(x) any(x > 0))
+non_zero_asv_names_nasal_swab <- names(non_zero_asvs_nasal_swab_idx[non_zero_asvs_nasal_swab_idx])
+
+# NASAL ASPIRATE
+
+OTU_table_nasal_aspirate <- otu_table(nasal_aspirate_samples)
+non_zero_asvs_nasal_aspirate_idx <- apply(OTU_table_nasal_aspirate, 1, function(x) any(x > 0))
+non_zero_asv_names_nasal_aspirate <- names(non_zero_asvs_nasal_aspirate_idx[non_zero_asvs_nasal_aspirate_idx])
+
+#saliva_asvs <- get_asvs(saliva_samples)
+#nasal_swab_asvs <- get_asvs(nasal_swab_samples)
+#nasal_aspirate_asvs <- get_asvs(nasal_aspirate_samples)
+
+# Create a list for Venn diagram input
+venn_list <- list(saliva = non_zero_asv_names_saliva, nasal_swab = non_zero_asv_names_nasal_swab, nasal_aspirate = non_zero_asv_names_nasal_aspirate)
+```
+
+
+This is enough to create a venn diagram. We could create a simple one like this:
+
+```{r}
+venn(venn_list)
+```
+
+But this is a bit more pretty:
+
+```{r}
+venn_diagram <- ggvenn(
+  venn_list, 
+  fill_color = c("#0073C2FF", "#EFC000FF", "#CD534CFF"),
+  stroke_size = 0.5, set_name_size = 5, 
+  show_percentage = F
+  )
+```
+
+
+## Rarefaction curve
+
+
+```{r}
+rarefaction_curve <- ggrare(bact_physeq.obj, step = 1000, color = "source", plot = FALSE, se = FALSE)
+
+rarefaction_curve <- rarefaction_curve + 
+  theme_bw() +
+  ggtitle("Rarefaction Curve Analysis of ASV Richness Across Samples") +
+  xlab("Sequence sample size") +
+  ylab("Observed ASVs") +
+  scale_color_manual(
+    name = "Sample source",
+    values = c("#4daf4a", "#ff7f00", "#377eb8"),
+    labels = c("Nasal Aspirate", "Nasal Swab", "Saliva"))
+```
+
+
+
+
+
+# Figures
+
+
+## Observed ASVs - Boxplot
+
+```{r}
+obsASV_boxplot
+```
+
+
+## Shannon diversity - Boxplot
+
+```{r}
+shannon_values_boxplot
+```
+
+
+
+## Principal Coordinate Analysis
+
+```{r}
+PCoA_plot
+```
+
+
+## Relative abundance - Genus - top20
+
+```{r}
+figure_top20_genus
+```
+
+
+
+## Relative abundance - Family - top20
+
+```{r}
+figure_whole20_family
+```
+
+
+## Observed ASVs - Venn diagram
+
+```{r}
+venn_diagram
+```
+
+
+## Rarefaction curves
+
+```{r}
+rarefaction_curve
+```
+
+
+
+
+# Statistical Test Results
+
+## Kruskal-Wallis and Wilcoxon rank sum test
+
+### Observed ASV
+
+```{r}
+kruskal.test(Observed ~ source, data = obs_richness.tbl)
+```
+
+Post-hoc with Wilcoxon rank sum test to identify the pair(s) that are statistically significant.
+
+```{r}
+pairwise.wilcox.test(obs_richness.tbl$Observed, obs_richness.tbl$source,
+                 p.adjust.method = "BH")
+```
+
+
+
+### Shannon values
+
+
+```{r}
+kruskal.test(Shannon ~ source, data = shannon_values.tbl)
+```
+
+
+Post-hoc with Wilcoxon rank sum test to identify the pair(s) that are statistically significant.
+
+```{r}
+pairwise.wilcox.test(shannon_values.tbl$Shannon, shannon_values.tbl$source,
+                 p.adjust.method = "BH")
+```
+
+
+
+## PERMANOVA
+
+
+Using the Bray-Curtis distance from before.
+
+
+```{r}
+adonis2(distance.bc ~ metadata_temp$source)
+```
+
+
+
+
